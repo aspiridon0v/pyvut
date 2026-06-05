@@ -755,6 +755,7 @@ class ViveTrackerGroup():
 
         self.tracker_map_state = [0]*5
         self.host_finalize_pending = [True]*5
+        self.client_end_map_once = [True]*5
         self.stuck_on_static = [0]*5
         self.stuck_on_exists = [0]*5
         self.stuck_on_not_checked = [0]*5
@@ -795,6 +796,7 @@ class ViveTrackerGroup():
 
         self.tracker_map_state[idx] = 0
         self.host_finalize_pending[idx] = True
+        self.client_end_map_once[idx] = True
         self.stuck_on_static[idx] = 0
         self.stuck_on_exists[idx] = 0
         self.stuck_on_not_checked[idx] = 0
@@ -867,9 +869,20 @@ class ViveTrackerGroup():
             self.stuck_on_exists[mac_to_idx(device_addr)] = 0
 
         if state == MAP_NOT_CHECKED:
-            if self.stuck_on_not_checked[mac_to_idx(device_addr)] == 0 and comms.is_client(device_addr) and comms.client_has_host_map(device_addr):
-                verbose_print("ok we're stuck on not checked, end the map again")
+            # Fire the client end_map at most ONCE per connection. end_map
+            # resets the firmware's map check, so re-firing it every time
+            # NOT_CHECKED reappears creates an endless NOT_CHECKED <-> EXIST
+            # loop that never lets the client's EXIST -> MAP_REUSE_OK check
+            # complete (observed live; the host completes that same check
+            # when left alone after its single end_map).
+            if (
+                self.client_end_map_once[mac_to_idx(device_addr)]
+                and comms.is_client(device_addr)
+                and comms.client_has_host_map(device_addr)
+            ):
+                verbose_print("client has host map — ending map once to trigger reuse check")
                 comms.lambda_end_map(device_addr)
+                self.client_end_map_once[mac_to_idx(device_addr)] = False
             self.stuck_on_not_checked[mac_to_idx(device_addr)] += 1
         else:
             self.stuck_on_not_checked[mac_to_idx(device_addr)] = 0
