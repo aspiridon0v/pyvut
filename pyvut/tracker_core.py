@@ -80,10 +80,12 @@ CONFIG_GRACE_MS = 3000
 # tracker that demonstrably holds a saved map (identity reset orphans it).
 SKIP_NEW_ID = os.environ.get("PYVUT_SKIP_NEW_ID") == "1"
 
-# Minimum map-build (scan) duration. The firmware reports MAP_REBUILT as soon
-# as a minimum viable snapshot exists (~seconds) but keeps extending the map
-# until end_map; finalizing at first REBUILT produces uselessly thin maps.
-MAP_BUILD_MIN_MS = int(os.environ.get("PYVUT_MAP_BUILD_S", "90")) * 1000
+# Optional extra map-build (scan) duration before finalize. Default 0 =
+# finalize immediately at MAP_REBUILT — empirically the flow that reaches
+# MAP_REUSE_OK; delaying end_map was observed to strand the session at
+# MAP_EXIST (the firmware locks coverage at REBUILT, it does not keep
+# extending). Kept as an env knob for future experiments only.
+MAP_BUILD_MIN_MS = int(os.environ.get("PYVUT_MAP_BUILD_S", "0")) * 1000
 
 # Pose tracking_status: the low nibble is the state (2 = pose+rot, 3 = rot only,
 # 4 = pose frozen); some firmware (e.g. 0909/rel-792) sets an extra 0x10 flag.
