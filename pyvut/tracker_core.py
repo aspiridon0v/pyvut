@@ -853,9 +853,16 @@ class ViveTrackerGroup():
             )
             comms.lambda_end_map(device_addr)
             self.host_finalize_pending[idx] = False
-        if state == MAP_SAVE_OK and prev_state != MAP_SAVE_OK and comms.is_host(device_addr):
+        # SAVE_OK is transient and easily missed between status polls; REUSE_OK
+        # (host settled into its saved map) is the state client transfers were
+        # observed to ride on — announce readiness on either.
+        if (
+            state in (MAP_SAVE_OK, MAP_REUSE_OK)
+            and prev_state != state
+            and comms.is_host(device_addr)
+        ):
             verbose_print(
-                f"Host map saved — marking transmission ready ({mac_str(device_addr)})"
+                f"Host map ready ({map_status_to_str(state)}) — marking transmission ready ({mac_str(device_addr)})"
             )
             comms.send_ack_to(idx, ACK_LAMBDA_SET_STATUS + f"{KEY_TRANSMISSION_READY},1")
 
