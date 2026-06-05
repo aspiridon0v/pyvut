@@ -754,6 +754,7 @@ class ViveTrackerGroup():
         #self.wip_pose_btns = [0]*5
 
         self.tracker_map_state = [0]*5
+        self.host_finalize_pending = [True]*5
         self.stuck_on_static = [0]*5
         self.stuck_on_exists = [0]*5
         self.stuck_on_not_checked = [0]*5
@@ -793,6 +794,7 @@ class ViveTrackerGroup():
             return
 
         self.tracker_map_state[idx] = 0
+        self.host_finalize_pending[idx] = True
         self.stuck_on_static[idx] = 0
         self.stuck_on_exists[idx] = 0
         self.stuck_on_not_checked[idx] = 0
@@ -803,7 +805,31 @@ class ViveTrackerGroup():
 
     # TODO: comms -> self
     def handle_map_state(self, comms, device_addr, state):
-        self.tracker_map_state[mac_to_idx(device_addr)] = state
+        idx = mac_to_idx(device_addr)
+        prev_state = self.tracker_map_state[idx]
+        self.tracker_map_state[idx] = state
+
+        # Host->client map handoff. A rebuilt host map stays session-only
+        # (MAP_REBUILT never advances to MAP_SAVE_OK on its own), so the host
+        # never becomes TRANSMISSION_READY and clients loop on "ask for map"
+        # forever. Once the host map is rebuilt AND the host is actually
+        # tracking, finalize it; once saved, announce transmission readiness.
+        if (
+            state == MAP_REBUILT
+            and comms.is_host(device_addr)
+            and self.host_finalize_pending[idx]
+            and self.is_actively_tracking(device_addr)
+        ):
+            verbose_print(
+                f"Host map rebuilt + tracking — finalizing map for transfer ({mac_str(device_addr)})"
+            )
+            comms.lambda_end_map(device_addr)
+            self.host_finalize_pending[idx] = False
+        if state == MAP_SAVE_OK and prev_state != MAP_SAVE_OK and comms.is_host(device_addr):
+            verbose_print(
+                f"Host map saved — marking transmission ready ({mac_str(device_addr)})"
+            )
+            comms.send_ack_to(idx, ACK_LAMBDA_SET_STATUS + f"{KEY_TRANSMISSION_READY},1")
 
         if self.stuck_on_static[mac_to_idx(device_addr)] > 7:
             verbose_print("ok we're stuck, end the map again")
