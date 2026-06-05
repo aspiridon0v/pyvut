@@ -909,31 +909,32 @@ class ViveTrackerGroup():
                     f"({mac_str(device_addr)})"
                 )
 
-        # Host->client map handoff. MAP_REBUILT appears as soon as a minimum
-        # viable snapshot exists, but the firmware keeps extending the map
-        # until end_map — so hold the build open for MAP_BUILD_MIN_MS of
-        # scanning before finalizing. end_map then persists the map and flips
-        # the session into stable tracking mode (without it the host never
-        # reaches MAP_SAVE_OK / TRANSMISSION_READY and clients wait forever).
+        # Host->client map handoff — ON DEMAND ONLY. At MAP_REBUILT the firmware
+        # transitions seamlessly from building into continuous-session tracking
+        # (observed on stock: stable 6DoF for minutes with no end_map at all).
+        # Sending end_map breaks that session: it forces save -> reload ->
+        # relocalize-from-scratch, which frequently fails against a snapshot
+        # map. So finalize ONLY when a connected client is actually waiting for
+        # the host map (transfer requires a saved map); single-tracker sessions
+        # keep the stock continuous-tracking behavior.
         if (
             state == MAP_REBUILT
             and comms.is_host(device_addr)
             and self.host_finalize_pending[idx]
         ):
-            started = self.map_build_started_ms[idx]
-            elapsed = current_milli_time() - started if started else MAP_BUILD_MIN_MS
-            if elapsed < MAP_BUILD_MIN_MS:
-                remaining = int((MAP_BUILD_MIN_MS - elapsed) / 1000)
-                verbose_print(
-                    f"Map building — keep moving, {remaining}s before finalize ({mac_str(device_addr)})"
-                )
-                return
-            verbose_print(
-                f"Host map rebuilt — finalizing (end_map) to enter tracking mode ({mac_str(device_addr)})"
+            client_waiting = any(
+                i != comms.current_host_id
+                and comms.is_client_connected(i)
+                and not comms.has_host_map[i]
+                for i in range(5)
             )
-            comms.lambda_end_map(device_addr)
-            self.host_finalize_pending[idx] = False
-            self.map_build_started_ms[idx] = 0
+            if client_waiting:
+                verbose_print(
+                    f"Client waiting for host map — finalizing (end_map) host {mac_str(device_addr)}"
+                )
+                comms.lambda_end_map(device_addr)
+                self.host_finalize_pending[idx] = False
+                self.map_build_started_ms[idx] = 0
         # SAVE_OK is transient and easily missed between status polls; REUSE_OK
         # (host settled into its saved map) is the state client transfers were
         # observed to ride on — announce readiness on either.
