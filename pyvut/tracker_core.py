@@ -68,6 +68,17 @@ def verbose_print(*args, **kwargs):
 def current_milli_time():
     return round(time.time() * 1000)
 
+# Grace window after a pair/reconnect event before (re)configuring a tracker.
+# A tracker that booted standalone and reused its stored map streams full 6DoF
+# poses within this window; configuring it would stop/restart its SLAM session
+# and force a map rebuild, so such trackers are left alone.
+CONFIG_GRACE_MS = 3000
+
+# Pose tracking_status: the low nibble is the state (2 = pose+rot, 3 = rot only,
+# 4 = pose frozen); some firmware (e.g. 0909/rel-792) sets an extra 0x10 flag.
+POSE_STATUS_STATE_MASK = 0x0F
+POSE_STATUS_POSE_VALID = 2
+
 def hex_dump(b, prefix=""):
     p = prefix
     b = bytes(b)
@@ -170,6 +181,10 @@ class DongleHID(Ackable):
         self.ack_callback = None
         self.connected_callback = None
         self.disconnected_callback = None
+        # Returns True for a MAC whose SLAM session is already producing 6DoF
+        # poses (set by ViveTrackerGroup) — such trackers are left unconfigured.
+        self.actively_tracking_cb = None
+        self.pending_config = {}  # idx -> (config_deadline_ms, mac_bytes)
 
         self.pair_state = [0,0,0,0,0]
         self.connected_to_host = [False]*5
@@ -402,14 +417,62 @@ class DongleHID(Ackable):
         if self.disconnected_callback:
             self.disconnected_callback(self, idx)
 
+    def _configure_tracker(self, paired_mac):
+        """Assign role/mode to a tracker — stops and restarts its SLAM session."""
+        paired_mac_str = mac_str(paired_mac)
+        # I really wish they included the index of each tracker *somewhere*, but it seems
+        # like the MACs have always been fake anyhow
+        self.ack_set_role_id(mac_to_idx(paired_mac), 1)
+        self.ack_set_tracking_mode(mac_to_idx(paired_mac), -1)
+
+        #if self.num_paired <= 1:
+        if self.current_host_id == -1 or self.is_host(paired_mac):
+            test_mode = TRACKING_MODE_SLAM_HOST
+            self.current_host_id = mac_to_idx(paired_mac)
+            verbose_print(f"Making {paired_mac_str} the SLAM host")
+            self.wifi_set_country(mac_to_idx(paired_mac), self.wifi_info["country"])
+            self.ack_set_tracking_host(mac_to_idx(paired_mac), 1)
+            self.ack_set_wifi_host(mac_to_idx(paired_mac), 1)
+            self.ack_set_new_id(mac_to_idx(paired_mac), 0)
+        else:
+            test_mode = TRACKING_MODE_SLAM_CLIENT
+            #self.wifi_connect(mac_to_idx(paired_mac))
+            new_id = int(mac_to_idx(paired_mac))
+
+            self.ack_set_tracking_host(mac_to_idx(paired_mac), 0)
+            self.ack_set_wifi_host(mac_to_idx(paired_mac), 0)
+            self.ack_set_new_id(mac_to_idx(paired_mac), new_id)
+
+        self.ack_set_tracking_mode(mac_to_idx(paired_mac), test_mode)
+
+    def _process_pending_config(self):
+        if not self.pending_config:
+            return
+        now = current_milli_time()
+        for idx in list(self.pending_config):
+            deadline, mac = self.pending_config[idx]
+            if self.actively_tracking_cb and self.actively_tracking_cb(mac):
+                del self.pending_config[idx]
+                if self.current_host_id == -1:
+                    self.current_host_id = idx
+                    verbose_print(
+                        f"Adopting {mac_str(mac)} as SLAM host (already tracking; left unconfigured)"
+                    )
+                else:
+                    verbose_print(f"Skipping config for {mac_str(mac)} (already tracking)")
+            elif now >= deadline:
+                del self.pending_config[idx]
+                self._configure_tracker(mac)
+
     def do_loop(self):
+        self._process_pending_config()
         resp = self.device_hid1.read(0x400)
         if len(resp) <= 0:
             return
         #verbose_print("dump:")
         #hex_dump(resp)
         #verbose_print("parsed:")
-        # 0x18 = paired event, gives the 
+        # 0x18 = paired event, gives the
         if resp[0] == DRESP_PAIR_EVENT:
             self.got_a_pair = True
             #verbose_print("dump:")
@@ -429,37 +492,25 @@ class DongleHID(Ackable):
             self.calib_2 = ""
 
             if is_unpair:
+                self.pending_config.pop(mac_to_idx(paired_mac), None)
                 self.handle_disconnected(mac_to_idx(paired_mac))
                 return
 
-            # I really wish they included the index of each tracker *somewhere*, but it seems
-            # like the MACs have always been fake anyhow
-            self.ack_set_role_id(mac_to_idx(paired_mac), 1)
-            self.ack_set_tracking_mode(mac_to_idx(paired_mac), -1)
+            # No-stomp attach: configuring a tracker stops and restarts its SLAM
+            # session (losing its loaded map), so don't do it blindly — a tracker
+            # that booted standalone already reuses its stored map and streams
+            # poses. Defer configuration for a grace window; if full 6DoF poses
+            # show up in the meantime, leave its session untouched.
+            self.pending_config[mac_to_idx(paired_mac)] = (
+                current_milli_time() + CONFIG_GRACE_MS,
+                bytes(paired_mac),
+            )
+            verbose_print(
+                f"Deferring config for {paired_mac_str} "
+                f"({CONFIG_GRACE_MS} ms grace to detect an active SLAM session)"
+            )
 
-            # TODO: detect re-pairs and force re-init
-            
-            #if self.num_paired <= 1:
-            if self.current_host_id == -1 or self.is_host(paired_mac):
-                test_mode = TRACKING_MODE_SLAM_HOST
-                self.current_host_id = mac_to_idx(paired_mac)
-                verbose_print(f"Making {paired_mac_str} the SLAM host")
-                self.wifi_set_country(mac_to_idx(paired_mac), self.wifi_info["country"])
-                self.ack_set_tracking_host(mac_to_idx(paired_mac), 1)
-                self.ack_set_wifi_host(mac_to_idx(paired_mac), 1)
-                self.ack_set_new_id(mac_to_idx(paired_mac), 0)
-            else:
-                test_mode = TRACKING_MODE_SLAM_CLIENT
-                #self.wifi_connect(mac_to_idx(paired_mac))
-                new_id = int(mac_to_idx(paired_mac))
 
-                self.ack_set_tracking_host(mac_to_idx(paired_mac), 0)
-                self.ack_set_wifi_host(mac_to_idx(paired_mac), 0)
-                self.ack_set_new_id(mac_to_idx(paired_mac), new_id)
-
-            self.ack_set_tracking_mode(mac_to_idx(paired_mac), test_mode)
-
-            
         elif resp[0] == DRESP_TRACKER_RF_STATUS or resp[0] == DRESP_TRACKER_NEW_RF_STATUS or resp[0] == 0x29:
             verbose_print(f"dump for {hex(resp[0])}:")
             #hex_dump(resp)
@@ -722,6 +773,7 @@ class ViveTrackerGroup():
         self.comms.ack_callback = self.parse_ack
         self.comms.connected_callback = self.handle_connected
         self.comms.disconnected_callback = self.handle_disconnected
+        self.comms.actively_tracking_cb = self.is_actively_tracking
 
     def add_pose_listener(self, listener):
         if listener not in self.pose_listeners:
@@ -1001,6 +1053,17 @@ class ViveTrackerGroup():
 
     def get_map_state(self, device_addr):
         return self.tracker_map_state[mac_to_idx(device_addr)]
+
+    def is_actively_tracking(self, device_addr):
+        """True if this tracker produced a full 6DoF pose within the last few seconds.
+
+        Used by DongleHID to leave already-tracking SLAM sessions unconfigured
+        (configuring restarts the session and forces a map rebuild).
+        """
+        idx = mac_to_idx(device_addr)
+        recent = current_milli_time() - self.pose_time[idx] < CONFIG_GRACE_MS
+        pose_ok = (self.pose_tracking_status[idx] & POSE_STATUS_STATE_MASK) == POSE_STATUS_POSE_VALID
+        return recent and pose_ok
 
     def get_pos(self, idx=0):
         return np.array(self.pose_pos[idx])
