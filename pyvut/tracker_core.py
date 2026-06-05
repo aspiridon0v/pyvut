@@ -809,19 +809,18 @@ class ViveTrackerGroup():
         prev_state = self.tracker_map_state[idx]
         self.tracker_map_state[idx] = state
 
-        # Host->client map handoff. A rebuilt host map stays session-only
-        # (MAP_REBUILT never advances to MAP_SAVE_OK on its own), so the host
-        # never becomes TRANSMISSION_READY and clients loop on "ask for map"
-        # forever. Once the host map is rebuilt AND the host is actually
-        # tracking, finalize it; once saved, announce transmission readiness.
+        # Host->client map handoff. MAP_REBUILT means mapping mode finished
+        # gathering — but the session stays in mapping mode (6DoF only comes in
+        # short bursts) until end_map flips it into stable tracking mode and
+        # persists the map. Without this, the host never reaches MAP_SAVE_OK /
+        # TRANSMISSION_READY and clients loop on "ask for map" forever.
         if (
             state == MAP_REBUILT
             and comms.is_host(device_addr)
             and self.host_finalize_pending[idx]
-            and self.is_actively_tracking(device_addr)
         ):
             verbose_print(
-                f"Host map rebuilt + tracking — finalizing map for transfer ({mac_str(device_addr)})"
+                f"Host map rebuilt — finalizing (end_map) to enter tracking mode ({mac_str(device_addr)})"
             )
             comms.lambda_end_map(device_addr)
             self.host_finalize_pending[idx] = False
