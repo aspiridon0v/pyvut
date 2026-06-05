@@ -167,7 +167,7 @@ class Ackable(object):
 
 class DongleHID(Ackable):
 
-    def __init__(self, wifi_info_path=None):
+    def __init__(self, wifi_info_path=None, preferred_host=None):
         self.calib_1 = ""
         self.calib_2 = ""
         self.device_macs = []
@@ -185,6 +185,11 @@ class DongleHID(Ackable):
         # poses (set by ViveTrackerGroup) — such trackers are left unconfigured.
         self.actively_tracking_cb = None
         self.pending_config = {}  # idx -> (config_deadline_ms, mac_bytes)
+        # MAC suffix (e.g. "76:9a:1c:c3") that must become the SLAM host.
+        # Deterministic host = stable map = stable world origin across runs.
+        # Other trackers wait for it instead of winning the host race.
+        self.preferred_host = preferred_host.lower() if preferred_host else None
+        self._held_for_host_logged = set()
 
         self.pair_state = [0,0,0,0,0]
         self.connected_to_host = [False]*5
@@ -417,6 +422,9 @@ class DongleHID(Ackable):
         if self.disconnected_callback:
             self.disconnected_callback(self, idx)
 
+    def _matches_preferred_host(self, mac):
+        return self.preferred_host is not None and mac_str(mac).lower().endswith(self.preferred_host)
+
     def _configure_tracker(self, paired_mac):
         """Assign role/mode to a tracker — stops and restarts its SLAM session."""
         paired_mac_str = mac_str(paired_mac)
@@ -425,8 +433,11 @@ class DongleHID(Ackable):
         self.ack_set_role_id(mac_to_idx(paired_mac), 1)
         self.ack_set_tracking_mode(mac_to_idx(paired_mac), -1)
 
-        #if self.num_paired <= 1:
-        if self.current_host_id == -1 or self.is_host(paired_mac):
+        if self.preferred_host is not None:
+            wants_host = self._matches_preferred_host(paired_mac) or self.is_host(paired_mac)
+        else:
+            wants_host = self.current_host_id == -1 or self.is_host(paired_mac)
+        if wants_host:
             test_mode = TRACKING_MODE_SLAM_HOST
             self.current_host_id = mac_to_idx(paired_mac)
             verbose_print(f"Making {paired_mac_str} the SLAM host")
@@ -453,7 +464,9 @@ class DongleHID(Ackable):
             deadline, mac = self.pending_config[idx]
             if self.actively_tracking_cb and self.actively_tracking_cb(mac):
                 del self.pending_config[idx]
-                if self.current_host_id == -1:
+                if self.current_host_id == -1 and (
+                    self.preferred_host is None or self._matches_preferred_host(mac)
+                ):
                     self.current_host_id = idx
                     verbose_print(
                         f"Adopting {mac_str(mac)} as SLAM host (already tracking; left unconfigured)"
@@ -461,6 +474,20 @@ class DongleHID(Ackable):
                 else:
                     verbose_print(f"Skipping config for {mac_str(mac)} (already tracking)")
             elif now >= deadline:
+                if (
+                    self.preferred_host is not None
+                    and self.current_host_id == -1
+                    and not self._matches_preferred_host(mac)
+                ):
+                    # Hold non-preferred trackers until the designated host is up,
+                    # so they configure as clients of the right map.
+                    self.pending_config[idx] = (now + CONFIG_GRACE_MS, mac)
+                    if idx not in self._held_for_host_logged:
+                        self._held_for_host_logged.add(idx)
+                        verbose_print(
+                            f"Holding config for {mac_str(mac)} — waiting for preferred host *{self.preferred_host}"
+                        )
+                    continue
                 del self.pending_config[idx]
                 self._configure_tracker(mac)
 
@@ -742,7 +769,7 @@ class TrackerHID(Ackable):
 
 class ViveTrackerGroup():
 
-    def __init__(self, mode="DONGLE_USB", wifi_info_path=None, debug=True):
+    def __init__(self, mode="DONGLE_USB", wifi_info_path=None, debug=True, preferred_host=None):
         set_tracker_core_verbose(debug)
         self.poses_recvd = [0]*5
         self.pose_quat = [[0.0, 0.0, 0.0, 1.0]] * 5
@@ -767,7 +794,7 @@ class ViveTrackerGroup():
 
         # TODO: mix of multiple?
         if mode == "DONGLE_USB":
-            self.comms = DongleHID(wifi_info_path=wifi_info_path)
+            self.comms = DongleHID(wifi_info_path=wifi_info_path, preferred_host=preferred_host)
         elif mode == "TRACKER_USB":
             self.comms = TrackerHID(wifi_info_path=wifi_info_path)
 
