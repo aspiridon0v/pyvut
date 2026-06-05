@@ -80,6 +80,11 @@ CONFIG_GRACE_MS = 3000
 # tracker that demonstrably holds a saved map (identity reset orphans it).
 SKIP_NEW_ID = os.environ.get("PYVUT_SKIP_NEW_ID") == "1"
 
+# Minimum map-build (scan) duration. The firmware reports MAP_REBUILT as soon
+# as a minimum viable snapshot exists (~seconds) but keeps extending the map
+# until end_map; finalizing at first REBUILT produces uselessly thin maps.
+MAP_BUILD_MIN_MS = int(os.environ.get("PYVUT_MAP_BUILD_S", "90")) * 1000
+
 # Pose tracking_status: the low nibble is the state (2 = pose+rot, 3 = rot only,
 # 4 = pose frozen); some firmware (e.g. 0909/rel-792) sets an extra 0x10 flag.
 POSE_STATUS_STATE_MASK = 0x0F
@@ -806,6 +811,7 @@ class ViveTrackerGroup():
         self.host_finalize_pending = [True]*5
         self.client_end_map_once = [True]*5
         self.recheck_map_once = [True]*5
+        self.map_build_started_ms = [0]*5
         self.stuck_on_static = [0]*5
         self.stuck_on_exists = [0]*5
         self.stuck_on_not_checked = [0]*5
@@ -849,6 +855,7 @@ class ViveTrackerGroup():
         self.host_finalize_pending[idx] = True
         self.client_end_map_once[idx] = True
         self.recheck_map_once[idx] = True
+        self.map_build_started_ms[idx] = 0
         self.stuck_on_static[idx] = 0
         self.stuck_on_exists[idx] = 0
         self.stuck_on_not_checked[idx] = 0
@@ -863,13 +870,19 @@ class ViveTrackerGroup():
         prev_state = self.tracker_map_state[idx]
         self.tracker_map_state[idx] = state
 
+        # fresh_map: discard the saved map. Must fire AFTER the map check has
+        # completed (EXIST/REUSE_OK) — sending RESET_MAP while the subsystem is
+        # still booting (first NOT_CHECKED report) gets silently ignored.
         if self.fresh_map_pending and comms.is_host(device_addr):
-            self.fresh_map_pending = False
-            # A deliberate rebuild follows; don't second-guess its NOTEXIST.
-            self.recheck_map_once[idx] = False
-            verbose_print(f"Forcing fresh map (RESET_MAP) on host {mac_str(device_addr)}")
-            comms.lambda_reset_map(device_addr)
-            return
+            if state in (MAP_EXIST, MAP_REUSE_OK):
+                self.fresh_map_pending = False
+                self.recheck_map_once[idx] = False  # the rebuild's NOTEXIST is deliberate
+                verbose_print(f"Forcing fresh map (RESET_MAP) on host {mac_str(device_addr)}")
+                comms.lambda_reset_map(device_addr)
+                return
+            if state == MAP_NOTEXIST and not self.recheck_map_once[idx]:
+                # Re-check also found nothing — genuinely no map; just build.
+                self.fresh_map_pending = False
 
         # The first map check after configuration races the SLAM subsystem
         # coming up and spuriously reports NOTEXIST on trackers that hold a
@@ -885,21 +898,40 @@ class ViveTrackerGroup():
             comms.lambda_end_map(device_addr)
             return
 
-        # Host->client map handoff. MAP_REBUILT means mapping mode finished
-        # gathering — but the session stays in mapping mode (6DoF only comes in
-        # short bursts) until end_map flips it into stable tracking mode and
-        # persists the map. Without this, the host never reaches MAP_SAVE_OK /
-        # TRANSMISSION_READY and clients loop on "ask for map" forever.
+        # Track when a build (scan) starts so we can give it a real duration.
+        if state in (MAP_REBUILD_WAIT_FOR_STATIC, MAP_REBUILD_CREATE_MAP):
+            if self.map_build_started_ms[idx] == 0:
+                self.map_build_started_ms[idx] = current_milli_time()
+                verbose_print(
+                    f"Map build started — keep moving ~{MAP_BUILD_MIN_MS // 1000}s "
+                    f"({mac_str(device_addr)})"
+                )
+
+        # Host->client map handoff. MAP_REBUILT appears as soon as a minimum
+        # viable snapshot exists, but the firmware keeps extending the map
+        # until end_map — so hold the build open for MAP_BUILD_MIN_MS of
+        # scanning before finalizing. end_map then persists the map and flips
+        # the session into stable tracking mode (without it the host never
+        # reaches MAP_SAVE_OK / TRANSMISSION_READY and clients wait forever).
         if (
             state == MAP_REBUILT
             and comms.is_host(device_addr)
             and self.host_finalize_pending[idx]
         ):
+            started = self.map_build_started_ms[idx]
+            elapsed = current_milli_time() - started if started else MAP_BUILD_MIN_MS
+            if elapsed < MAP_BUILD_MIN_MS:
+                remaining = int((MAP_BUILD_MIN_MS - elapsed) / 1000)
+                verbose_print(
+                    f"Map building — keep moving, {remaining}s before finalize ({mac_str(device_addr)})"
+                )
+                return
             verbose_print(
                 f"Host map rebuilt — finalizing (end_map) to enter tracking mode ({mac_str(device_addr)})"
             )
             comms.lambda_end_map(device_addr)
             self.host_finalize_pending[idx] = False
+            self.map_build_started_ms[idx] = 0
         # SAVE_OK is transient and easily missed between status polls; REUSE_OK
         # (host settled into its saved map) is the state client transfers were
         # observed to ride on — announce readiness on either.
