@@ -805,6 +805,7 @@ class ViveTrackerGroup():
         self.tracker_map_state = [0]*5
         self.host_finalize_pending = [True]*5
         self.client_end_map_once = [True]*5
+        self.recheck_map_once = [True]*5
         self.stuck_on_static = [0]*5
         self.stuck_on_exists = [0]*5
         self.stuck_on_not_checked = [0]*5
@@ -847,6 +848,7 @@ class ViveTrackerGroup():
         self.tracker_map_state[idx] = 0
         self.host_finalize_pending[idx] = True
         self.client_end_map_once[idx] = True
+        self.recheck_map_once[idx] = True
         self.stuck_on_static[idx] = 0
         self.stuck_on_exists[idx] = 0
         self.stuck_on_not_checked[idx] = 0
@@ -863,8 +865,24 @@ class ViveTrackerGroup():
 
         if self.fresh_map_pending and comms.is_host(device_addr):
             self.fresh_map_pending = False
+            # A deliberate rebuild follows; don't second-guess its NOTEXIST.
+            self.recheck_map_once[idx] = False
             verbose_print(f"Forcing fresh map (RESET_MAP) on host {mac_str(device_addr)}")
             comms.lambda_reset_map(device_addr)
+            return
+
+        # The first map check after configuration races the SLAM subsystem
+        # coming up and spuriously reports NOTEXIST on trackers that hold a
+        # saved map (observed repeatedly; a later re-check finds it). Force one
+        # re-check via end_map before letting a rebuild start; if the second
+        # check still says NOTEXIST, the map is genuinely absent and the
+        # rebuild proceeds.
+        if state == MAP_NOTEXIST and comms.is_host(device_addr) and self.recheck_map_once[idx]:
+            self.recheck_map_once[idx] = False
+            verbose_print(
+                f"First map check says NOTEXIST — forcing re-check before rebuild ({mac_str(device_addr)})"
+            )
+            comms.lambda_end_map(device_addr)
             return
 
         # Host->client map handoff. MAP_REBUILT means mapping mode finished
