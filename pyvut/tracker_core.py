@@ -1,4 +1,5 @@
 import hid
+import os
 import struct
 import numpy as np
 import time
@@ -73,6 +74,11 @@ def current_milli_time():
 # poses within this window; configuring it would stop/restart its SLAM session
 # and force a map rebuild, so such trackers are left alone.
 CONFIG_GRACE_MS = 3000
+
+# Experiment: skip ack_set_new_id during tracker configuration. set_new_id is
+# the prime suspect for the configured session reporting MAP_NOTEXIST on a
+# tracker that demonstrably holds a saved map (identity reset orphans it).
+SKIP_NEW_ID = os.environ.get("PYVUT_SKIP_NEW_ID") == "1"
 
 # Pose tracking_status: the low nibble is the state (2 = pose+rot, 3 = rot only,
 # 4 = pose frozen); some firmware (e.g. 0909/rel-792) sets an extra 0x10 flag.
@@ -444,7 +450,10 @@ class DongleHID(Ackable):
             self.wifi_set_country(mac_to_idx(paired_mac), self.wifi_info["country"])
             self.ack_set_tracking_host(mac_to_idx(paired_mac), 1)
             self.ack_set_wifi_host(mac_to_idx(paired_mac), 1)
-            self.ack_set_new_id(mac_to_idx(paired_mac), 0)
+            if SKIP_NEW_ID:
+                verbose_print(f"PYVUT_SKIP_NEW_ID=1 — keeping map identity for {paired_mac_str}")
+            else:
+                self.ack_set_new_id(mac_to_idx(paired_mac), 0)
         else:
             test_mode = TRACKING_MODE_SLAM_CLIENT
             #self.wifi_connect(mac_to_idx(paired_mac))
@@ -452,7 +461,10 @@ class DongleHID(Ackable):
 
             self.ack_set_tracking_host(mac_to_idx(paired_mac), 0)
             self.ack_set_wifi_host(mac_to_idx(paired_mac), 0)
-            self.ack_set_new_id(mac_to_idx(paired_mac), new_id)
+            if SKIP_NEW_ID:
+                verbose_print(f"PYVUT_SKIP_NEW_ID=1 — keeping map identity for {paired_mac_str}")
+            else:
+                self.ack_set_new_id(mac_to_idx(paired_mac), new_id)
 
         self.ack_set_tracking_mode(mac_to_idx(paired_mac), test_mode)
 
@@ -867,7 +879,10 @@ class ViveTrackerGroup():
             comms.send_ack_to(idx, ACK_LAMBDA_SET_STATUS + f"{KEY_TRANSMISSION_READY},1")
 
         if self.stuck_on_static[mac_to_idx(device_addr)] > 7:
-            verbose_print("ok we're stuck, end the map again")
+            # Actually send end_map (upstream only printed): aborts the wedged
+            # build so the firmware re-checks for an existing saved map.
+            verbose_print("Stuck in WAIT_FOR_STATIC — ending map to recover")
+            comms.lambda_end_map(device_addr)
             self.bump_map_once_2[mac_to_idx(device_addr)] = True
             self.stuck_on_static[mac_to_idx(device_addr)] = 0
 
