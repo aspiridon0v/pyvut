@@ -115,6 +115,10 @@ class Ackable(object):
     def lambda_end_map(self, device_addr):
         self.send_ack_to(mac_to_idx(device_addr), ACK_END_MAP)
 
+    def lambda_reset_map(self, device_addr):
+        """Discard the tracker's loaded/saved map so a fresh build starts."""
+        self.send_ack_to(mac_to_idx(device_addr), ACK_LAMBDA_COMMAND + f"{RESET_MAP}")
+
     def send_ack_to(self, idx, ack):
         verbose_print("UNIMPLEMENTED")
 
@@ -781,8 +785,14 @@ class TrackerHID(Ackable):
 
 class ViveTrackerGroup():
 
-    def __init__(self, mode="DONGLE_USB", wifi_info_path=None, debug=True, preferred_host=None):
+    def __init__(
+        self, mode="DONGLE_USB", wifi_info_path=None, debug=True, preferred_host=None,
+        fresh_map=False,
+    ):
         set_tracker_core_verbose(debug)
+        # When True, send RESET_MAP to the host on its first map-state report,
+        # discarding a poor saved map so the user can build a good one.
+        self.fresh_map_pending = fresh_map
         self.poses_recvd = [0]*5
         self.pose_quat = [[0.0, 0.0, 0.0, 1.0]] * 5
         self.pose_pos = [[0.0, 0.0, 0.0]] * 5
@@ -807,6 +817,7 @@ class ViveTrackerGroup():
         # TODO: mix of multiple?
         if mode == "DONGLE_USB":
             self.comms = DongleHID(wifi_info_path=wifi_info_path, preferred_host=preferred_host)
+            # fresh_map handled in handle_map_state via self.fresh_map_pending
         elif mode == "TRACKER_USB":
             self.comms = TrackerHID(wifi_info_path=wifi_info_path)
 
@@ -849,6 +860,12 @@ class ViveTrackerGroup():
         idx = mac_to_idx(device_addr)
         prev_state = self.tracker_map_state[idx]
         self.tracker_map_state[idx] = state
+
+        if self.fresh_map_pending and comms.is_host(device_addr):
+            self.fresh_map_pending = False
+            verbose_print(f"Forcing fresh map (RESET_MAP) on host {mac_str(device_addr)}")
+            comms.lambda_reset_map(device_addr)
+            return
 
         # Host->client map handoff. MAP_REBUILT means mapping mode finished
         # gathering — but the session stays in mapping mode (6DoF only comes in

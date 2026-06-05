@@ -144,9 +144,13 @@ class UltimateTrackerAPI:
         poll_interval: float = 0.001,
         wifi_info_path: Optional[str] = None,
         preferred_host: Optional[str] = None,
+        fresh_map: bool = False,
     ) -> None:
         self._group = ViveTrackerGroup(
-            mode=mode, wifi_info_path=wifi_info_path, preferred_host=preferred_host
+            mode=mode,
+            wifi_info_path=wifi_info_path,
+            preferred_host=preferred_host,
+            fresh_map=fresh_map,
         )
         self._poll_interval = max(0.0, poll_interval)
         self._pose_callbacks: List[PoseCallback] = []
